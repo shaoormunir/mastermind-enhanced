@@ -18,9 +18,9 @@
 #define pr_fmt(fmt) "mastermind2: " fmt
 
 #include <linux/capability.h>
-#include <linux/cred.h>
 #include <linux/fs.h>
 #include <linux/gfp.h>
+#include<linux/cred.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/list.h>
@@ -42,36 +42,81 @@
 
 static int NUM_COLORS = 6;
 
-/** true if user is in the middle of a game */
-static bool game_active;
-
-/** code that player is trying to guess */
-static int target_code[NUM_PEGS];
-
-/** tracks number of guesses user has made */
-static unsigned num_guesses;
-
-/** result of most recent user guess */
-static char last_result[4];
-
-/** buffer that records all of user's guesses and their results */
-static char *user_view;
-
-/** number of bytes currently written to user view */
-static size_t user_view_size;
-
-/** pointer for the user_view */
-static loff_t user_view_pointer;
-
 /** number of games currently active */
 static int active_games = 0;
 
 /** number of games started */
 static int games_started = 0;
 
+/** number of times the code was changed **/
+static int colors_changed = 0;
+
+struct mm_game
+{
+	struct list_head list;
+	kuid_t uid;
+	bool game_active;
+	int target_code[NUM_PEGS];
+	unsigned num_guesses;
+	char last_result[4];
+	char *user_view;
+	size_t user_view_size;
+	loff_t user_view_pointer;
+};
+
+struct list_head game_list;
+LIST_HEAD(game_list);
+
 DEFINE_SPINLOCK(device_data_lock);
 
+/**
+ * initialize_game() - initializes all required variables for the game
+ * */
+static void initialize_game(struct mm_game * game)
+{
+	size_t i;
+	game->target_code[0] = 4;
+	game->target_code[1] = 2;
+	game->target_code[2] = 1;
+	game->target_code[3] = 1;
+	game->num_guesses = 0;
+	for (i = 0; i < 4096; i++)
+	{
+		game->user_view[i] = 0;
+	}
+	game->user_view_pointer = 0;
+	game->user_view_size = 0;
+	game->game_active = true;
+	games_started++;
+	game->last_result[0] = 'B';
+	game->last_result[1] = '-';
+	game->last_result[2] = 'W';
+	game->last_result[3] = '-';
+}
 
+static struct mm_game *mm_find_game(kuid_t uid){
+	struct list_head *ptr;
+	struct mm_game * game;
+	for (ptr = game_list.next; ptr!=&game_list; ptr = ptr->next){
+		game = list_entry (ptr, struct mm_game, list);
+		if (uid_eq(game->uid, uid)){
+			return game;
+		} 
+	}
+	struct mm_game * new = (struct mm_game *) kzalloc(sizeof(struct mm_game), GFP_KERNEL);
+	new->uid = uid;
+	spin_lock(&device_data_lock);
+	new->user_view = vmalloc(PAGE_SIZE);
+	if (!new->user_view)
+	{
+		pr_err("Could not allocate memory\n");
+		spin_unlock(&device_data_lock);
+		return -ENOMEM;
+	}
+	list_add_tail(&new->list, game_list.next);
+	spin_unlock(&device_data_lock);
+	return new;
+}
 /**
  * mm_num_pegs() - calculate number of black pegs and number of white pegs
  * @target: target code, up to NUM_PEGS elements
@@ -144,30 +189,7 @@ static bool compare_strings(const char *source_string, size_t source_size, const
 	}
 	return areEqual;
 }
-/**
- * initialize_game() - initializes all required variables for the game
- * */
-static void initialize_game(void)
-{
-	size_t i;
-	target_code[0] = 4;
-	target_code[1] = 2;
-	target_code[2] = 1;
-	target_code[3] = 1;
-	num_guesses = 0;
-	for (i = 0; i < 4096; i++)
-	{
-		user_view[i] = 0;
-	}
-	user_view_pointer = 0;
-	user_view_size = 0;
-	game_active = true;
-	games_started++;
-	last_result[0] = 'B';
-	last_result[1] = '-';
-	last_result[2] = 'W';
-	last_result[3] = '-';
-}
+
 /**
  * mm_read() - callback invoked when a process reads from
  * /dev/mm
@@ -190,6 +212,7 @@ static void initialize_game(void)
 static ssize_t mm_read(struct file *filp, char __user *ubuf, size_t count,
 					   loff_t *ppos)
 {
+	struct mm_game * game = mm_find_game(current_cred()->uid);
 	size_t bytes_to_copy = 4 - *ppos;
 	if (bytes_to_copy > count && count > 0)
 	{
@@ -203,9 +226,9 @@ static ssize_t mm_read(struct file *filp, char __user *ubuf, size_t count,
 	{
 		spin_lock(&device_data_lock);
 		int copy_result = 0;
-		if (game_active)
+		if (game->game_active)
 		{
-			copy_result = copy_to_user(ubuf + *ppos, last_result, bytes_to_copy);
+			copy_result = copy_to_user(ubuf + *ppos, game->last_result, bytes_to_copy);
 		}
 		else
 		{
@@ -257,7 +280,7 @@ static size_t convert_number_to_array(int number, char **result)
  * writes the result to user view array
  * @user_guess: user's guess
  * */
-static void write_last_result_to_user_view(char *user_guess)
+static void write_last_result_to_user_view(char *user_guess, struct mm_game * game)
 {
 
 	char result_to_write[USER_VIEW_LINE_SIZE];
@@ -271,28 +294,28 @@ static void write_last_result_to_user_view(char *user_guess)
 		result_to_write[i] = 0;
 	}
 	current_result_buffer_pointer += scnprintf(result_to_write, 7, "Guess ");
-	guess_array_size = convert_number_to_array(num_guesses, &guess_number_char_array);
+	guess_array_size = convert_number_to_array(game->num_guesses, &guess_number_char_array);
 
 	current_result_buffer_pointer += scnprintf(result_to_write + current_result_buffer_pointer, guess_array_size + 1, guess_number_char_array);
 	current_result_buffer_pointer += scnprintf(result_to_write + current_result_buffer_pointer, 3, ": ");
-	current_result_buffer_pointer += scnprintf(result_to_write + current_result_buffer_pointer, 5, last_result);
+	current_result_buffer_pointer += scnprintf(result_to_write + current_result_buffer_pointer, 5, game->last_result);
 	current_result_buffer_pointer += scnprintf(result_to_write + current_result_buffer_pointer, 4, " | ");
 	current_result_buffer_pointer += scnprintf(result_to_write + current_result_buffer_pointer, NUM_PEGS + 1, user_guess);
 	current_result_buffer_pointer += scnprintf(result_to_write + current_result_buffer_pointer, 2, "\n");
-	strcpy(user_view + user_view_pointer, result_to_write);
-	user_view_pointer += USER_VIEW_LINE_SIZE;
-	user_view_size += USER_VIEW_LINE_SIZE;
+	strcpy(game->user_view + game->user_view_pointer, result_to_write);
+	game->user_view_pointer += USER_VIEW_LINE_SIZE;
+	game->user_view_size += USER_VIEW_LINE_SIZE;
 }
 
-static void write_success_message_to_user_view(void){
+static void write_success_message_to_user_view(struct mm_game * game){
 	char result_to_write[USER_VIEW_LINE_SIZE];
 	loff_t current_result_buffer_pointer;
 	current_result_buffer_pointer = 0;
 	current_result_buffer_pointer += scnprintf(result_to_write, 20, "You won, game over!");
 	current_result_buffer_pointer += scnprintf(result_to_write + current_result_buffer_pointer, 2, "\n");
-	strcpy(user_view + user_view_pointer, result_to_write);
-	user_view_pointer += USER_VIEW_LINE_SIZE;
-	user_view_size += USER_VIEW_LINE_SIZE;
+	strcpy(game->user_view + game->user_view_pointer, result_to_write);
+	game->user_view_pointer += USER_VIEW_LINE_SIZE;
+	game->user_view_size += USER_VIEW_LINE_SIZE;
 }
 
 /**
@@ -319,12 +342,13 @@ static ssize_t
 mm_write(struct file *filp, const char __user *ubuf,
 		 size_t count, loff_t *ppos)
 {
+	struct mm_game * game = mm_find_game(current_cred()->uid);
 	int correct_place_guesses = 0;
 	int correct_value_guesses = 0;
 	char temp_array[NUM_PEGS] = {};
 	int user_guess[NUM_PEGS] = {};
 	size_t i;
-	if (game_active)
+	if (game->game_active)
 	{
 		if (count < NUM_PEGS)
 		{
@@ -339,14 +363,14 @@ mm_write(struct file *filp, const char __user *ubuf,
 			{
 				user_guess[i] = temp_array[i] - '0';
 			}
-			mm_num_pegs(target_code, user_guess, &correct_place_guesses, &correct_value_guesses);
-			last_result[1] = '0' + correct_place_guesses;
-			last_result[3] = '0' + correct_value_guesses;
-			num_guesses++;
-			write_last_result_to_user_view(temp_array);
+			mm_num_pegs(game->target_code, user_guess, &correct_place_guesses, &correct_value_guesses);
+			game->last_result[1] = '0' + correct_place_guesses;
+			game->last_result[3] = '0' + correct_value_guesses;
+			game->num_guesses++;
+			write_last_result_to_user_view(temp_array, game);
 			if(correct_place_guesses == 4){
-				write_success_message_to_user_view();
-				game_active = false;
+				write_success_message_to_user_view(game);
+				game->game_active = false;
 			}
 			spin_unlock(&device_data_lock);
 			return count;
@@ -375,8 +399,10 @@ mm_write(struct file *filp, const char __user *ubuf,
  */
 static int mm_mmap(struct file *filp, struct vm_area_struct *vma)
 {
+
+	struct mm_game * game = mm_find_game(current_cred()->uid);
 	unsigned long size = (unsigned long)(vma->vm_end - vma->vm_start);
-	unsigned long page = vmalloc_to_pfn(user_view);
+	unsigned long page = vmalloc_to_pfn(game->user_view);
 	if (size > PAGE_SIZE)
 		return -EIO;
 	vma->vm_pgoff = 0;
@@ -412,6 +438,7 @@ static int mm_mmap(struct file *filp, struct vm_area_struct *vma)
 static ssize_t mm_ctl_write(struct file *filp, const char __user *ubuf,
 							size_t count, loff_t *ppos)
 {
+	struct mm_game * game = mm_find_game(current_cred()->uid);
 	char temp_array[8] = {};
 	size_t temp_length = 8;
 	if (count < 8)
@@ -424,11 +451,11 @@ static ssize_t mm_ctl_write(struct file *filp, const char __user *ubuf,
 
 	if (compare_strings(temp_array, temp_length, "start", 5))
 	{
-		initialize_game();
+		initialize_game(game);
 	}
 	else if (compare_strings(temp_array, temp_length, "quit", 4))
 	{
-		game_active = false;
+		game->game_active = false;
 	}
 	else if (compare_strings(temp_array, 6, "colors", 6)){
 		if (!capable(CAP_SYS_ADMIN)){
@@ -438,7 +465,8 @@ static ssize_t mm_ctl_write(struct file *filp, const char __user *ubuf,
 		else{
 			int colors = temp_array[7] - 48;
 			if (colors >= 2 && colors <= 9){
-				NUM_COLORS = colors;		
+				NUM_COLORS = colors;
+				colors_changed++;		
 			}
 			else
 			{
@@ -609,12 +637,6 @@ static int mastermind_probe(struct platform_device *pdev)
 	/* Part 1: YOUR CODE HERE */
 	int retval;
 	pr_info("Initializing the game.\n");
-	user_view = vmalloc(PAGE_SIZE);
-	if (!user_view)
-	{
-		pr_err("Could not allocate memory\n");
-		return -ENOMEM;
-	}
 	retval = misc_register(&mastermind_device);
 	if (retval)
 	{
@@ -653,8 +675,16 @@ static int mastermind_remove(struct platform_device *pdev)
 {
 	/* Merge the contents of your original mastermind_exit() here. */
 	/* Part 1: YOUR CODE HERE */
+	struct list_head *pos, *n;
+	struct mm_game *temp;
+
 	pr_info("Freeing resources.\n");
-	vfree(user_view);
+	 for (pos = game_list.next, n = pos->next; pos != game_list.next; pos = n, n = pos->next){
+		 temp = list_entry(pos, struct mm_game, list);
+		 list_del(pos);
+		 vfree(temp->user_view);
+		 vfree(temp);
+	 }
 
 	misc_deregister(&mastermind_device);
 	misc_deregister(&mastermind_ctl_device);
